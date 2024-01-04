@@ -1,7 +1,8 @@
-import * as aws from 'aws-sdk';
-import { PromiseResult } from 'aws-sdk/lib/request';
+import { S3Client } from '@aws-sdk/client-s3';
+import { SendMessageCommand, SendMessageCommandOutput, SQSClient } from '@aws-sdk/client-sqs';
 import { v4 as uuid } from 'uuid';
 import { S3PayloadMeta } from './types';
+import { Upload } from "@aws-sdk/lib-storage";
 import {
     buildS3PayloadWithExtendedCompatibility,
     buildS3Payload,
@@ -17,8 +18,8 @@ export interface SqsProducerOptions {
     largePayloadThoughS3?: boolean;
     allPayloadThoughS3?: boolean;
     s3Bucket?: string;
-    sqs?: aws.SQS;
-    s3?: aws.S3;
+    sqs?: SQSClient;
+    s3?: S3Client;
     sqsEndpointUrl?: string;
     s3EndpointUrl?: string;
     messageSizeThreshold?: number;
@@ -34,8 +35,8 @@ export interface SqsMessageOptions {
 }
 
 export class SqsProducer {
-    private sqs: aws.SQS;
-    private s3: aws.S3;
+    private sqs: SQSClient;
+    private s3: S3Client;
     private queueUrl: string;
     private largePayloadThoughS3: boolean;
     private allPayloadThoughS3: boolean;
@@ -47,7 +48,7 @@ export class SqsProducer {
         if (options.sqs) {
             this.sqs = options.sqs;
         } else {
-            this.sqs = new aws.SQS({
+            this.sqs = new SQSClient({
                 region: options.region,
                 endpoint: options.sqsEndpointUrl,
             });
@@ -55,13 +56,13 @@ export class SqsProducer {
         if (options.largePayloadThoughS3 || options.allPayloadThoughS3) {
             if (!options.s3Bucket) {
                 throw new Error(
-                    'Need to specify "s3Bucket" option when using allPayloadThoughS3 or  largePayloadThoughS3.'
+                    'Need to specify "s3Bucket" option when using allPayloadThoughS3 or largePayloadThoughS3.'
                 );
             }
             if (options.s3) {
                 this.s3 = options.s3;
             } else {
-                this.s3 = new aws.S3({
+                this.s3 = new S3Client({
                     region: options.region,
                     endpoint: options.s3EndpointUrl,
                 });
@@ -87,15 +88,17 @@ export class SqsProducer {
         if ((msgSize > this.messageSizeThreshold && this.largePayloadThoughS3) || this.allPayloadThoughS3) {
             const payloadId = uuid();
             const payloadKey = this.extendedLibraryCompatibility ? payloadId : `${payloadId}.json`;
-            const s3Response = await this.s3
-                .upload({
-                    Bucket: this.s3Bucket,
-                    Body: messageBody,
-                    Key: payloadKey,
-                    ContentType: 'application/json',
-                })
-                .promise();
+            const uploadToS3 = new Upload({
+                client: this.s3,
+                params: {
+                  Key: payloadKey,
+                  Body: messageBody,
+                  Bucket: this.s3Bucket,
+                }, 
+            })
 
+            const s3Response = await uploadToS3.done();
+        
             const sqsResponse = await this.sendS3Payload(
                 {
                     Id: payloadId,
@@ -115,15 +118,14 @@ export class SqsProducer {
             throw new Error("Message is too big. Use 'largePayloadThoughS3' option to send large payloads though S3.");
         }
 
-        const sqsResponse = await this.sqs
-            .sendMessage({
-                QueueUrl: this.queueUrl,
-                MessageBody: messageBody,
-                DelaySeconds: options.DelaySeconds,
-                MessageDeduplicationId: options.MessageDeduplicationId,
-                MessageGroupId: options.MessageGroupId,
-            })
-            .promise();
+        const command = new SendMessageCommand({
+                    QueueUrl: this.queueUrl,
+                    MessageBody: messageBody,
+                    DelaySeconds: options.DelaySeconds,
+                    MessageDeduplicationId: options.MessageDeduplicationId,
+                    MessageGroupId: options.MessageGroupId,
+                });
+        const sqsResponse = await this.sqs.send(command);
 
         return {
             sqsResponse,
@@ -137,12 +139,12 @@ export class SqsProducer {
         s3PayloadMeta: S3PayloadMeta,
         msgSize?: number,
         options: SqsMessageOptions = {}
-    ): Promise<PromiseResult<aws.SQS.SendMessageResult, aws.AWSError>> {
+    ): Promise<SendMessageCommandOutput> {
         const messageAttributes = this.extendedLibraryCompatibility
             ? createExtendedCompatibilityAttributeMap(msgSize)
             : {};
-        return await this.sqs
-            .sendMessage({
+
+        const command = new SendMessageCommand({
                 QueueUrl: this.queueUrl,
                 MessageBody: this.extendedLibraryCompatibility
                     ? buildS3PayloadWithExtendedCompatibility(s3PayloadMeta)
@@ -151,7 +153,7 @@ export class SqsProducer {
                 MessageDeduplicationId: options.MessageDeduplicationId,
                 MessageGroupId: options.MessageGroupId,
                 MessageAttributes: messageAttributes,
-            })
-            .promise();
+        });
+        return await this.sqs.send(command);
     }
 }

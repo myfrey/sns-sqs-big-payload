@@ -8,10 +8,12 @@ import {
     SnsProducer,
     SqsMessage,
 } from '../src';
-
-import * as aws from 'aws-sdk';
+import { CreateBucketCommand, DeleteBucketCommand, DeleteObjectCommand, ListObjectsCommand, S3Client } from '@aws-sdk/client-s3';
+import { CreateTopicCommand, DeleteTopicCommand, SNSClient, SubscribeCommand } from '@aws-sdk/client-sns';
+import { CreateQueueCommand, DeleteQueueCommand, GetQueueAttributesCommand, SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { v4 as uuid } from 'uuid';
 import { S3PayloadMeta } from '../src/types';
+import { Upload } from '@aws-sdk/lib-storage';
 
 // Real AWS services (for dev testing)
 // const TEST_TOPIC_ARN = 'arn:aws:sns:eu-west-1:731241200085:test-sns-producer';
@@ -34,20 +36,20 @@ process.env.AWS_SECRET_ACCESS_KEY = 'test'
 process.env.AWS_ACCESS_KEY_ID = 'test'
 
 function getClients() {
-    const sns = new aws.SNS({
+    const sns = new SNSClient({
         endpoint: TEST_ENDPOINTS.snsEndpointUrl,
         region: TEST_REGION,
     });
 
-    const sqs = new aws.SQS({
+    const sqs = new SQSClient({
         endpoint: TEST_ENDPOINTS.sqsEndpointUrl,
         region: TEST_REGION,
     });
 
-    const s3 = new aws.S3({
+    const s3 = new S3Client({
         endpoint: TEST_ENDPOINTS.s3EndpointUrl,
         region: TEST_REGION,
-        s3ForcePathStyle: true,
+        forcePathStyle: true,
     });
 
     return { sns, sqs, s3 };
@@ -55,27 +57,27 @@ function getClients() {
 async function initAws() {
     const { sns, sqs } = getClients();
     const res = await Promise.all([
-        await sns.createTopic({ Name: 'test-sns-producer' }).promise(),
-        await sqs.createQueue({ QueueName: QUEUE_NAME }).promise(),
-        await sqs.createQueue({ QueueName: QUEUE_2_NAME }).promise(),
+        await sns.send(new CreateTopicCommand({ Name: 'test-sns-producer' })),
+        await sqs.send(new CreateQueueCommand({ QueueName: QUEUE_NAME })),
+        await sqs.send(new CreateQueueCommand({ QueueName: QUEUE_2_NAME })),
     ]);
 
     testQueueUrl = res[1].QueueUrl as string;
     testQueue2Url = res[2].QueueUrl as string;
     try {
-        const response = await sqs.getQueueAttributes({
+        const response = await sqs.send(new GetQueueAttributesCommand({
           AttributeNames: ['QueueArn'],
           QueueUrl: testQueueUrl
-        }).promise();
+        }));
         if (response.Attributes && response.Attributes.QueueArn) {
           const { Attributes: { QueueArn } } = response;
-          await sns
-          .subscribe({
+          await sns.send(
+          new SubscribeCommand({
               Protocol: 'sqs',
               TopicArn: TEST_TOPIC_ARN,
               Endpoint: QueueArn
-          })
-          .promise();
+          }))
+          ;
         } else {
           throw new Error('QueueArn not found in the response.');
         }
@@ -87,9 +89,9 @@ async function initAws() {
 async function cleanAws() {
     const { sns, sqs } = getClients();
     await Promise.all([
-        sns.deleteTopic({ TopicArn: TEST_TOPIC_ARN }).promise(),
-        sqs.deleteQueue({ QueueUrl: testQueueUrl }).promise(),
-        sqs.deleteQueue({ QueueUrl: testQueue2Url }).promise(),
+        sns.send(new DeleteTopicCommand({ TopicArn: TEST_TOPIC_ARN })),
+        sqs.send(new DeleteQueueCommand({ QueueUrl: testQueueUrl })),
+        sqs.send(new DeleteQueueCommand({ QueueUrl: testQueue2Url })),
     ]);
 }
 
@@ -118,27 +120,31 @@ async function sendS3Payload(s3PayloadMeta: S3PayloadMeta, options: Partial<SqsP
 async function sendMessageInCompatibilityFormat(jsonBody: any, options: Partial<SqsProducerOptions>, generateMessageTemplate?: (s3BucketName: string, s3Key: string) => string) {
     const s3ObjectKey = uuid();
     const { s3, sqs } = getClients();
-    const s3Response = await s3.putObject({
-        Bucket: options.s3Bucket as string,
-        Key: s3ObjectKey,
-        Body: jsonBody,
-    }).promise();
-    const sqsResponse = await sqs
-        .sendMessage({
-            QueueUrl: options.queueUrl as string,
-            MessageBody: generateMessageTemplate ?
-                generateMessageTemplate(options.s3Bucket as string, s3ObjectKey) :
-                `["software.amazon.payloadoffloading.PayloadS3Pointer",{"s3BucketName":"${options.s3Bucket}","s3Key":"${s3ObjectKey}"}]`,
-            MessageAttributes: {
-                SQSLargePayloadSize: {
-                    StringValue: '5198',
-                    StringListValues: [],
-                    BinaryListValues: [],
-                    DataType: 'Number',
-                },
+
+    const uploadToS3 = new Upload({
+        client: s3,
+        params: {
+                Bucket: options.s3Bucket as string,
+                Key: s3ObjectKey,
+                Body: jsonBody,
+            } 
+    })
+
+    const s3Response = await uploadToS3.done();
+    const sqsResponse = await sqs.send(new SendMessageCommand({
+        QueueUrl: options.queueUrl as string,
+        MessageBody: generateMessageTemplate ?
+            generateMessageTemplate(options.s3Bucket as string, s3ObjectKey) :
+            `["software.amazon.payloadoffloading.PayloadS3Pointer",{"s3BucketName":"${options.s3Bucket}","s3Key":"${s3ObjectKey}"}]`,
+        MessageAttributes: {
+            SQSLargePayloadSize: {
+                StringValue: '5198',
+                StringListValues: [],
+                BinaryListValues: [],
+                DataType: 'Number',
             },
-        })
-        .promise();
+        },
+    }))
     return { s3Response, sqsResponse, s3ObjectKey };
 }
 
@@ -179,12 +185,14 @@ async function receiveMessages(
             region: TEST_REGION,
             parsePayload: (raw) => JSON.parse(raw),
             ...options,
+            ...TEST_ENDPOINTS,
             s3,
         });
 
         sqsConsumer.on(SqsConsumerEvents.messageParsed, (message) => {
             messages.push(message);
         });
+
 
         sqsConsumer.on(SqsConsumerEvents.messageProcessed, () => {
             if (messages.length === expectedMsgsCount) {
@@ -227,31 +235,30 @@ async function receiveMessages(
 describe('sns-sqs-big-payload', () => {
     beforeAll(async () => {
         const { s3 } = getClients();
-        await s3
-            .createBucket({
-                Bucket: TEST_BUCKET_NAME,
-                ACL: 'public-read',
-            })
-            .promise();
+        await s3.send(new CreateBucketCommand({
+            Bucket: TEST_BUCKET_NAME,
+            ACL: 'public-read',
+        })
+        );   
     });
 
     afterAll(async ()=> {
         const { s3 } = getClients();
-        const objects = await s3.listObjects({
+        const objects = await s3.send(new ListObjectsCommand({
             Bucket: TEST_BUCKET_NAME,
-        }).promise();
+        }));
 
         await Promise.all((objects.Contents || []).map(({Key}) => {
            if(!Key) return;
-            return s3.deleteObject({
+            return s3.send(new DeleteObjectCommand({
                 Bucket: TEST_BUCKET_NAME,
                 Key
-            }).promise();
+            }));
         }));
 
-        await s3.deleteBucket({
+        await s3.send(new DeleteBucketCommand({
             Bucket: TEST_BUCKET_NAME,
-        }).promise()
+        }))
     });
 
     beforeEach(async () => {

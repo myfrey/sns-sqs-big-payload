@@ -1,7 +1,6 @@
-import * as aws from 'aws-sdk';
 import { EventEmitter } from 'events';
-import { Message, MessageBodyAttributeMap, ReceiveMessageRequest, ReceiveMessageResult } from 'aws-sdk/clients/sqs';
-import { AWSError } from 'aws-sdk';
+import { Message, ReceiveMessageRequest, ReceiveMessageResult, SQSClient, ReceiveMessageCommand, DeleteMessageCommand, DeleteMessageBatchCommand, MessageAttributeValue  } from '@aws-sdk/client-sqs';
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { PayloadMeta, S3PayloadMeta, SqsExtendedPayloadMeta } from './types';
 import { SQS_LARGE_PAYLOAD_SIZE_ATTRIBUTE } from './constants';
 
@@ -11,8 +10,8 @@ export interface SqsConsumerOptions {
     batchSize?: number;
     waitTimeSeconds?: number;
     getPayloadFromS3?: boolean;
-    sqs?: aws.SQS;
-    s3?: aws.S3;
+    sqs?: SQSClient;
+    s3?: S3Client;
     sqsEndpointUrl?: string;
     s3EndpointUrl?: string;
     handleMessage?(message: SqsMessage): Promise<void>;
@@ -51,8 +50,8 @@ export interface SqsMessage {
 }
 
 export class SqsConsumer {
-    private sqs: aws.SQS;
-    private s3: aws.S3;
+    private sqs: SQSClient;
+    private s3: S3Client;
     private queueUrl: string;
     private getPayloadFromS3: boolean;
     private batchSize: number;
@@ -70,7 +69,7 @@ export class SqsConsumer {
         if (options.sqs) {
             this.sqs = options.sqs;
         } else {
-            this.sqs = new aws.SQS({
+            this.sqs = new SQSClient({
                 region: options.region,
                 endpoint: options.sqsEndpointUrl,
             });
@@ -79,7 +78,7 @@ export class SqsConsumer {
             if (options.s3) {
                 this.s3 = options.s3;
             } else {
-                this.s3 = new aws.S3({
+                this.s3 = new S3Client({
                     region: options.region,
                     endpoint: options.s3EndpointUrl,
                 });
@@ -133,20 +132,11 @@ export class SqsConsumer {
                 if (!this.started) return;
                 await this.handleSqsResponse(response);
             } catch (err) {
-                if (this.isConnError(err)) {
-                    this.events.emit(SqsConsumerEvents.connectionError, err);
-                    await new Promise((resolve) => setTimeout(resolve, this.connErrorTimeout));
-                } else {
-                    this.events.emit(SqsConsumerEvents.error, err);
-                }
+                this.events.emit(SqsConsumerEvents.error, err);
             }
             this.events.emit(SqsConsumerEvents.batchProcessed);
         }
         this.events.emit(SqsConsumerEvents.pollEnded);
-    }
-
-    private isConnError(err: AWSError): boolean {
-        return err.statusCode === 403 || err.code === 'CredentialsError' || err.code === 'UnknownEndpoint';
     }
 
     private async handleSqsResponse(result: ReceiveMessageResult): Promise<void> {
@@ -186,7 +176,6 @@ export class SqsConsumer {
         const messageBody = this.transformMessageBody ? this.transformMessageBody(message.Body) : message.Body;
         const { rawPayload, s3PayloadMeta } = await this.getMessagePayload(messageBody, message.MessageAttributes);
         const payload = this.parseMessagePayload(rawPayload);
-
         return {
             payload,
             s3PayloadMeta,
@@ -219,7 +208,7 @@ export class SqsConsumer {
 
     private async getMessagePayload(
         messageBody: any,
-        attributes: MessageBodyAttributeMap
+        attributes: Record<string, MessageAttributeValue>
     ): Promise<{ rawPayload: any; s3PayloadMeta?: S3PayloadMeta }> {
         if (!this.getPayloadFromS3) {
             return { rawPayload: messageBody };
@@ -262,10 +251,9 @@ export class SqsConsumer {
             }
             if (s3PayloadMeta) {
                 try {
-                    const s3Response = await this.s3
-                        .getObject({ Bucket: s3PayloadMeta.Bucket, Key: s3PayloadMeta.Key })
-                        .promise();
-                    return { rawPayload: s3Response.Body, s3PayloadMeta };
+                    const command = new GetObjectCommand({ Bucket: s3PayloadMeta.Bucket, Key: s3PayloadMeta.Key });
+                    const s3Response = await this.s3.send(command);
+                    return { rawPayload: await s3Response.Body.transformToString("utf8"), s3PayloadMeta };
                 } catch (err) {
                     this.events.emit(SqsConsumerEvents.s3PayloadError, {
                         err,
@@ -295,27 +283,27 @@ export class SqsConsumer {
     }
 
     private async receiveMessages(params: ReceiveMessageRequest): Promise<ReceiveMessageResult> {
-        return await this.sqs.receiveMessage(params).promise();
+        const command = new ReceiveMessageCommand(params);
+        const response = await this.sqs.send(command);
+        return response; 
     }
 
     private async deleteMessage(message: Message): Promise<void> {
-        await this.sqs
-            .deleteMessage({
-                QueueUrl: this.queueUrl,
-                ReceiptHandle: message.ReceiptHandle,
-            })
-            .promise();
+        const command = new DeleteMessageCommand({
+                    QueueUrl: this.queueUrl,
+                    ReceiptHandle: message.ReceiptHandle,
+                });
+        await this.sqs.send(command); 
     }
 
     private async deleteBatch(messages: Message[]): Promise<void> {
-        await this.sqs
-            .deleteMessageBatch({
-                QueueUrl: this.queueUrl,
-                Entries: messages.map((message, index) => ({
-                    Id: index.toString(),
-                    ReceiptHandle: message.ReceiptHandle,
-                })),
-            })
-            .promise();
+        const command = new DeleteMessageBatchCommand({
+            QueueUrl: this.queueUrl,
+            Entries: messages.map((message, index) => ({
+                Id: index.toString(),
+                ReceiptHandle: message.ReceiptHandle,
+            })),
+        })
+        await this.sqs.send(command);
     }
 }

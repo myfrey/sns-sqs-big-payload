@@ -1,8 +1,8 @@
-import { MessageAttributeMap } from 'aws-sdk/clients/sns';
+import { MessageAttributeValue } from '@aws-sdk/client-sns';
 import { S3PayloadMeta, PayloadMeta, SqsExtendedPayloadMeta } from './types';
 import { AMAZON_EXTENDED_CLIENT_PAYLOAD_OFFLOADING_REFERENCE, SQS_LARGE_PAYLOAD_SIZE_ATTRIBUTE } from './constants';
 
-export function createExtendedCompatibilityAttributeMap(msgSize: number): MessageAttributeMap {
+export function createExtendedCompatibilityAttributeMap(msgSize: number): Record<string, MessageAttributeValue> {
     const result = {};
     result[SQS_LARGE_PAYLOAD_SIZE_ATTRIBUTE] = {
         StringValue: '' + msgSize,
