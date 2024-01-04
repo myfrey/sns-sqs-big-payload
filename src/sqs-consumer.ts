@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { Message, ReceiveMessageRequest, ReceiveMessageResult, SQSClient, ReceiveMessageCommand, DeleteMessageCommand, DeleteMessageBatchCommand, MessageAttributeValue  } from '@aws-sdk/client-sqs';
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { PayloadMeta, S3PayloadMeta, SqsExtendedPayloadMeta } from './types';
 import { SQS_LARGE_PAYLOAD_SIZE_ATTRIBUTE } from './constants';
 
@@ -21,6 +21,7 @@ export interface SqsConsumerOptions {
     // Opt-in to enable compatibility with
     // Amazon SQS Extended Client Java Library (and other compatible libraries)
     extendedLibraryCompatibility?: boolean;
+    deleteFromS3AfterProcessing?: boolean; //delete message from S3 after processing
 }
 
 export interface ProcessingOptions {
@@ -64,6 +65,7 @@ export class SqsConsumer {
     private parsePayload?: (payload: any) => any;
     private transformMessageBody?: (messageBody: any) => any;
     private extendedLibraryCompatibility: boolean;
+    private deleteFromS3AfterProcessing?: boolean;
 
     constructor(options: SqsConsumerOptions) {
         if (options.sqs) {
@@ -94,6 +96,7 @@ export class SqsConsumer {
         this.parsePayload = options.parsePayload;
         this.transformMessageBody = options.transformMessageBody;
         this.extendedLibraryCompatibility = options.extendedLibraryCompatibility;
+        this.deleteFromS3AfterProcessing = options.deleteFromS3AfterProcessing;
     }
 
     static create(options: SqsConsumerOptions): SqsConsumer {
@@ -200,6 +203,9 @@ export class SqsConsumer {
             if (deleteAfterProcessing) {
                 await this.deleteMessage(message);
             }
+            if (this.deleteFromS3AfterProcessing){
+                await this.deleteFromS3(message);
+            }
             this.events.emit(SqsConsumerEvents.messageProcessed, message);
         } catch (err) {
             this.events.emit(SqsConsumerEvents.processingError, { err, message });
@@ -294,6 +300,12 @@ export class SqsConsumer {
                     ReceiptHandle: message.ReceiptHandle,
                 });
         await this.sqs.send(command); 
+    }
+
+    private async deleteFromS3(message: Message): Promise<void> {
+        const objectKey = JSON.parse(message.Body).S3Payload.Key;
+        const bucket = JSON.parse(message.Body).S3Payload.Bucket;
+        await this.s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey }));
     }
 
     private async deleteBatch(messages: Message[]): Promise<void> {

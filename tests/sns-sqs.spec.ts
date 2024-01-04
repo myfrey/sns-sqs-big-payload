@@ -642,6 +642,20 @@ describe('sns-sqs-big-payload', () => {
             });
         });
 
+        describe('deleting message after processing', () => {
+            it('should delete files form s3 after processing', async () => {
+                const message = 'x'.repeat(256 * 1024 + 1);
+                await sendMessage(message, { largePayloadThoughS3: true, s3Bucket: TEST_BUCKET_NAME });
+                const [receivedMessage] = await receiveMessages(1, { getPayloadFromS3: true, deleteFromS3AfterProcessing: true });
+                expect(receivedMessage.payload).toEqual(message);
+                const { s3 } = getClients();
+                const objects = await s3.send(new ListObjectsCommand({
+                    Bucket: TEST_BUCKET_NAME,
+                }));
+                expect(objects?.Contents ?? []).not.toContainEqual(expect.objectContaining({Key: receivedMessage.s3PayloadMeta.Key}));
+            }); 
+        })
+
         describe('publishing message through s3', () => {
             it('should send payload though s3 if configured - for all messages', async () => {
                 const message = { it: 'works' };
